@@ -1,0 +1,2 @@
+source /home/yacine/gitRepos/project-echo/build/bootloader/gdbinit/symbols
+source /home/yacine/gitRepos/project-echo/build/bootloader/gdbinit/connect

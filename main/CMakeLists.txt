@@ -1,2 +1,7 @@
 idf_component_register(SRCS "main.c"
-                    INCLUDE_DIRS ".")
+                    "implementations/joystick/joystick_impl.c"
+                    "implementations/push_button/push_button_impl.c"
+                    "implementations/potentiometer/potentiometer_impl.c"
+                    INCLUDE_DIRS "." 
+                    REQUIRES joystick led push_button potentiometer buzzer_passive
+                )

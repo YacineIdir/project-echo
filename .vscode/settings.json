@@ -1,0 +1,7 @@
+{
+    "idf.currentSetup": "/home/yacine/.espressif/v6.1/esp-idf",
+    "cmake.configureOnOpen": false,
+    "cmake.automaticReconfigure": false,
+    "idf.flashType": "UART",
+    "idf.port": "/dev/ttyUSB0"
+}
