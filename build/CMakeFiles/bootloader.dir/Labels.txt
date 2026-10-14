@@ -1,0 +1,13 @@
+# Target labels
+ bootloader
+# Source files and their labels
+/home/yacine/gitRepos/project-echo/build/CMakeFiles/bootloader
+/home/yacine/gitRepos/project-echo/build/CMakeFiles/bootloader.rule
+/home/yacine/gitRepos/project-echo/build/CMakeFiles/bootloader-complete.rule
+/home/yacine/gitRepos/project-echo/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule
+/home/yacine/gitRepos/project-echo/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule
+/home/yacine/gitRepos/project-echo/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule
+/home/yacine/gitRepos/project-echo/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule
+/home/yacine/gitRepos/project-echo/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule
+/home/yacine/gitRepos/project-echo/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule
+/home/yacine/gitRepos/project-echo/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule
