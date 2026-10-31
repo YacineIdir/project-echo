@@ -1,0 +1,29 @@
+dependencies:
+  cezap/dfplayer_mini:
+    component_hash: f7f8fa312bdb4545cfe384856fa9ac1aeb81d85037314653da5a121e974ee1bb
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.4'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32
+    - esp32s2
+    - esp32s3
+    - esp32c2
+    - esp32c3
+    - esp32c6
+    - esp32h2
+    - esp32p4
+    version: 1.0.5
+  idf:
+    source:
+      type: idf
+    version: 6.1.0
+direct_dependencies:
+- cezap/dfplayer_mini
+manifest_hash: 3acddc9f63933cf0a46d2196f2b8834f6908fe46cc9b211e586c12d09a6dbdbc
+target: esp32
+version: 3.0.0
