@@ -636,12 +636,16 @@ void app_main(void)
 
     ESP_LOGI(TAG, "play folder 01 track 001");
     ESP_ERROR_CHECK(dfplayer_mini_play_folder_track(mp3, 1, 1));
+    // Boucle native du DFPlayer : plus fiable que de relancer manuellement sur l'évènement
+    // "piste terminée" (qui peut être manqué/retardé). Gardé comme filet de sécurité ci-dessous.
+    err = dfplayer_mini_loop_current(mp3, true);
+    ESP_LOGI(TAG, "loop_current: %s", esp_err_to_name(err));
 
     while (1) {
         dfplayer_mini_event_t ev;
         if (dfplayer_mini_wait_event(mp3, &ev, 3000) == ESP_OK) {
-            if (ev.type == DFPLAYER_MINI_EVT_TF_TRACK_DONE) {
-                dfplayer_mini_play_folder_track(mp3, 1, 1); // boucle
+            if (ev.type == DFPLAYER_MINI_EVT_TF_TRACK_DONE && !dfplayer_mini_is_playing(mp3)) {
+                dfplayer_mini_play_folder_track(mp3, 1, 1); // filet de sécurité si la boucle native s'arrête
             }
         } else {
             ESP_LOGI(TAG, "listening for audio... busy=%d", dfplayer_mini_is_playing(mp3));
