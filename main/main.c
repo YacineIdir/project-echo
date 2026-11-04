@@ -25,11 +25,13 @@
 #define LED_JOY_GPIO      GPIO_NUM_15 // LED qui guide/verrouille sur le joystick (tonalité+vitesse)
 
 // --- Échantillonnage ---
-// 24 kHz : Nyquist à 12 kHz -> les produits du mélange (porteuse jusqu'à 3800 Hz + voix jusqu'à 3000 Hz,
-// soit ~6800 Hz) restent loin du repliement. Si le log affiche beaucoup de "retards", redescendre à 22050.
-#define FS_HZ             24000
-// La période n'est pas un nombre entier de µs (41,67 µs) : on calcule l'échéance de chaque échantillon
-// à partir du compteur (voir audio_task) pour que le taux réel soit exactement FS_HZ.
+// 20 kHz : Nyquist à 10 kHz -> les produits du mélange (porteuse jusqu'à 3800 Hz + voix jusqu'à 3000 Hz,
+// soit ~6800 Hz) restent sous le repliement. Mesuré sur la carte : une itération de la boucle prend
+// ~46 µs (surtout adc_oneshot_read), donc le maximum est ~21,9 kHz -> 20 kHz (50 µs) garde de la marge.
+// Pour aller plus haut il faudrait passer l'entrée audio en ADC continu (DMA).
+#define FS_HZ             20000
+// On calcule l'échéance de chaque échantillon à partir du compteur (voir audio_task) pour que le taux
+// réel soit exactement FS_HZ même si la période n'est pas un nombre entier de µs.
 
 // --- Filtre passe-bande de l'inversion (comme le script Python : butter(8,[300,3000],bandpass),
 // approximé ici par un passe-haut 300Hz 4e ordre + passe-bas 3000Hz 4e ordre en cascade = 8e ordre) ---
@@ -60,9 +62,9 @@
 #define TONALITE_FEEDBACK_RANGE_DB ((TONALITE_DB_MAX - TONALITE_DB_MIN) / 2.0f) // échelle du clignotement
 
 // --- Vitesse (joystick Y) : relecture à débit variable dans un tampon circulaire. Plage fixe, cible aléatoire. ---
-// Backlog max avant que le tampon ne boucle. 2 s à 24 kHz = 48000 échantillons = 96 Ko, comme avant
-// (3 s à 16 kHz) : 3 s à 24 kHz (144 Ko) dépasserait le plus grand bloc libre de la RAM de l'ESP32.
-#define SPEED_BUF_SECONDS   2.0f
+// Backlog max avant que le tampon ne boucle. 2,4 s à 20 kHz = 48000 échantillons = 96 Ko, comme avant
+// (3 s à 16 kHz) : plus gros risquerait de dépasser le plus grand bloc libre de la RAM de l'ESP32.
+#define SPEED_BUF_SECONDS   2.4f
 #define SPEED_BUF_LEN       ((int)(SPEED_BUF_SECONDS * FS_HZ))
 #define PLAYBACK_RATE_MIN   0.5f
 #define PLAYBACK_RATE_MAX   1.5f
@@ -389,6 +391,7 @@ static void audio_task(void *arg)
     int64_t next_sample_us = schedule_start_us;
     int64_t last_report_us = next_sample_us;
     int sample_counter = 0;
+    int report_sample_counter = 0;
 
     const int ctrl_read_every_n_samples = FS_HZ / 100; // ~10 ms
     const int led_update_every_n_samples = FS_HZ / 5;  // ~200 ms (évite de redémarrer le timer trop souvent)
@@ -401,8 +404,13 @@ static void audio_task(void *arg)
             }
         } else if (now_us > next_sample_us) {
             delay_count++;
-            schedule_start_us = now_us; // resynchronisation
-            schedule_index = 0;
+            // Petit retard (lecture des contrôles toutes les 10 ms, affichage du log toutes les 0,5 s) :
+            // on enchaîne sans attendre pour le rattraper, sinon le taux réel tombe sous FS_HZ.
+            // Gros retard (> 20 ms) : on resynchronise.
+            if (now_us - next_sample_us > 20000) {
+                schedule_start_us = now_us;
+                schedule_index = 0;
+            }
         }
         schedule_index++;
         next_sample_us = schedule_start_us + (schedule_index * 1000000LL) / FS_HZ;
@@ -563,9 +571,12 @@ static void audio_task(void *arg)
             const char *etat_vit = vitesse_latched ? "LOCK" : (vitesse_ok ? "OK" : "--");
             ESP_LOGI(TAG_AUDIO,
                      "porteuse=%.1fHz(%s)  tonalite=%.1fdB(%s)  vitesse=%.3fx(%s)  "
-                     "crete_in=%.3f  crete_out=%.3f  ecretages=%u  retards=%u",
+                     "crete_in=%.3f  crete_out=%.3f  ecretages=%u  retards=%u  fs_reel=%dHz",
                      carrier_hz, etat_cle, tonalite_db, etat_ton, playback_rate, etat_vit,
-                     input_peak, output_peak, clip_count, delay_count);
+                     input_peak, output_peak, clip_count, delay_count,
+                     (int)((int64_t)(sample_counter - report_sample_counter) * 1000000LL / (now_us - last_report_us)));
+            report_sample_counter = sample_counter;
+            delay_count = 0; // compté par période de rapport (0,5 s), plus facile à lire
             input_peak = 0.0f;
             output_peak = 0.0f;
             clip_count = 0;
