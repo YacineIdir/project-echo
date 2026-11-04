@@ -25,8 +25,11 @@
 #define LED_JOY_GPIO      GPIO_NUM_15 // LED qui guide/verrouille sur le joystick (tonalité+vitesse)
 
 // --- Échantillonnage ---
-#define FS_HZ             16000
-#define SAMPLE_PERIOD_US  (1000000 / FS_HZ)
+// 24 kHz : Nyquist à 12 kHz -> les produits du mélange (porteuse jusqu'à 3800 Hz + voix jusqu'à 3000 Hz,
+// soit ~6800 Hz) restent loin du repliement. Si le log affiche beaucoup de "retards", redescendre à 22050.
+#define FS_HZ             24000
+// La période n'est pas un nombre entier de µs (41,67 µs) : on calcule l'échéance de chaque échantillon
+// à partir du compteur (voir audio_task) pour que le taux réel soit exactement FS_HZ.
 
 // --- Filtre passe-bande de l'inversion (comme le script Python : butter(8,[300,3000],bandpass),
 // approximé ici par un passe-haut 300Hz 4e ordre + passe-bas 3000Hz 4e ordre en cascade = 8e ordre) ---
@@ -57,7 +60,9 @@
 #define TONALITE_FEEDBACK_RANGE_DB ((TONALITE_DB_MAX - TONALITE_DB_MIN) / 2.0f) // échelle du clignotement
 
 // --- Vitesse (joystick Y) : relecture à débit variable dans un tampon circulaire. Plage fixe, cible aléatoire. ---
-#define SPEED_BUF_SECONDS   3.0f // backlog max avant que le tampon ne boucle (voir note dans le résumé)
+// Backlog max avant que le tampon ne boucle. 2 s à 24 kHz = 48000 échantillons = 96 Ko, comme avant
+// (3 s à 16 kHz) : 3 s à 24 kHz (144 Ko) dépasserait le plus grand bloc libre de la RAM de l'ESP32.
+#define SPEED_BUF_SECONDS   2.0f
 #define SPEED_BUF_LEN       ((int)(SPEED_BUF_SECONDS * FS_HZ))
 #define PLAYBACK_RATE_MIN   0.5f
 #define PLAYBACK_RATE_MAX   1.5f
@@ -68,7 +73,7 @@
 #define PLAYBACK_RATE_FEEDBACK_RANGE ((PLAYBACK_RATE_MAX - PLAYBACK_RATE_MIN) / 2.0f) // échelle du clignotement
 
 // --- Lissages / gains ---
-#define CENTER_TRACK_ALPHA 0.0005f
+#define CENTER_TRACK_ALPHA (8.0f / (float)FS_HZ) // constante de temps ~125 ms, quel que soit FS_HZ
 #define CTRL_SMOOTH_ALPHA  0.05f
 // Il faut rester dans la tolérance pendant ce nombre de lectures consécutives (~10ms chacune) avant
 // que ça verrouille -> évite qu'un bruit ADC ou un passage transitoire d'une fraction de seconde
@@ -379,7 +384,9 @@ static void audio_task(void *arg)
     center = measure_channel_average(io, io->audio_channel, 2000);
     ESP_LOGI(TAG_AUDIO, "Centre audio mesure: %.1f", center);
 
-    int64_t next_sample_us = esp_timer_get_time();
+    int64_t schedule_start_us = esp_timer_get_time();
+    int64_t schedule_index = 0; // nb d'échantillons depuis schedule_start_us
+    int64_t next_sample_us = schedule_start_us;
     int64_t last_report_us = next_sample_us;
     int sample_counter = 0;
 
@@ -394,9 +401,11 @@ static void audio_task(void *arg)
             }
         } else if (now_us > next_sample_us) {
             delay_count++;
-            next_sample_us = now_us; // resynchronisation
+            schedule_start_us = now_us; // resynchronisation
+            schedule_index = 0;
         }
-        next_sample_us += SAMPLE_PERIOD_US;
+        schedule_index++;
+        next_sample_us = schedule_start_us + (schedule_index * 1000000LL) / FS_HZ;
 
         if (sample_counter % ctrl_read_every_n_samples == 0) {
             int pot_raw = 0, joy_x_raw = 0, joy_y_raw = 0;
