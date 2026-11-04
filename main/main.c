@@ -455,6 +455,11 @@ typedef struct {
 } audio_stats_t;
 
 static audio_stats_t s_stats;
+
+// Dernier instant (ms) où l'entrée audio a dépassé AUDIO_LOUD_THRESHOLD : sert à détecter que le
+// DFPlayer s'est tu. Le bruit de fond mesuré à l'arrêt est ~0,008, la voix ~0,2-0,3.
+#define AUDIO_LOUD_THRESHOLD 0.04f
+static volatile uint32_t s_last_loud_ms;
 static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void log_task(void *arg)
@@ -705,6 +710,9 @@ static void audio_task(void *arg)
         if (fabsf(x) > input_peak) {
             input_peak = fabsf(x);
         }
+        if (fabsf(x) > AUDIO_LOUD_THRESHOLD) {
+            s_last_loud_ms = (uint32_t)(now_us / 1000);
+        }
 
         // Porte : les 3 verrouillées -> son normal (passe-droit), et ça reste vrai même si on bouge
         // les contrôles après (une fois trouvé, pas besoin de tenir la position). Sinon -> brouillé.
@@ -873,14 +881,46 @@ void app_main(void)
     ESP_LOGI(TAG, "play folder 01 track 001");
     ESP_ERROR_CHECK(dfplayer_mini_play_folder_track(mp3, 1, 1));
 
+    // 1) Le DFPlayer boucle lui-même sur la piste (CMD 0x19). Avant, on attendait l'événement
+    //    "piste terminée" (0x3D) pour relancer, mais sur ce montage il n'arrive jamais (la liaison
+    //    DFPlayer TX -> ESP32 est peu fiable : pas de 0x3F au boot, "0 fichier" alors que ça joue)
+    //    -> la lecture s'arrêtait pour de bon à la fin de la piste (~32 s).
+    vTaskDelay(pdMS_TO_TICKS(200));
+    dfplayer_mini_loop_current(mp3, true);
+
+    // 2) Filet de sécurité : si l'entrée audio reste silencieuse plus de SILENCE_RESTART_MS (module
+    //    qui a redémarré sur une chute d'alimentation, commande perdue...), on relance. La broche BUSY
+    //    n'est pas utilisable ici : elle indique "arrêté" même pendant la lecture.
+    const int poll_ms = 100;
+    const uint32_t SILENCE_RESTART_MS = 4000;
+    int restart_count = 0;
+    int heartbeat_ms = 0;
+    s_last_loud_ms = (uint32_t)(esp_timer_get_time() / 1000);
     while (1) {
         dfplayer_mini_event_t ev;
-        if (dfplayer_mini_wait_event(mp3, &ev, 3000) == ESP_OK) {
+        if (dfplayer_mini_wait_event(mp3, &ev, poll_ms) == ESP_OK) {
             if (ev.type == DFPLAYER_MINI_EVT_TF_TRACK_DONE) {
-                dfplayer_mini_play_folder_track(mp3, 1, 1); // boucle
+                dfplayer_mini_play_folder_track(mp3, 1, 1);
+                dfplayer_mini_loop_current(mp3, true);
             }
-        } else {
-            ESP_LOGI(TAG, "listening for audio... busy=%d", dfplayer_mini_is_playing(mp3));
+        }
+
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        uint32_t silent_ms = now_ms - s_last_loud_ms;
+        if (silent_ms >= SILENCE_RESTART_MS) {
+            restart_count++;
+            ESP_LOGW(TAG, "Aucun son du DFPlayer depuis %u ms -> relance de la piste (relance #%d)",
+                     (unsigned)silent_ms, restart_count);
+            dfplayer_mini_play_folder_track(mp3, 1, 1);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            dfplayer_mini_loop_current(mp3, true);
+            s_last_loud_ms = (uint32_t)(esp_timer_get_time() / 1000); // laisse le temps de redémarrer
+        }
+
+        heartbeat_ms += poll_ms;
+        if (heartbeat_ms >= 3000) {
+            heartbeat_ms = 0;
+            ESP_LOGI(TAG, "listening for audio... silence=%ums relances=%d", (unsigned)silent_ms, restart_count);
         }
     }
 }
