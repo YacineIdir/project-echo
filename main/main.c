@@ -99,6 +99,10 @@
 // verrouille par accident. ~0.8s ici.
 #define OK_STREAK_REQUIRED 80
 #define OUTPUT_GAIN        1.0f // Trop haut (ex: 3.0) sature le DAC en permanence -> bruit d'écrêtage
+// Une fois l'énigme résolue (les 3 verrouillés), le volume monte de 30 %. Transition progressive
+// (~50 ms) pour ne pas faire de "pop" au moment du déverrouillage.
+#define SOLVED_VOLUME_BOOST 1.3f
+#define GAIN_RAMP_ALPHA    (1.0f / (0.05f * (float)FS_HZ))
 
 // --- LED indicatrice : clignote plus vite en se rapprochant, fixe quand c'est bon ---
 #define LED_BLINK_FAST_MS  80
@@ -626,6 +630,7 @@ static void audio_task(void *arg)
     uint32_t delay_count = 0;
     uint32_t clip_count = 0;
     uint32_t max_late_us = 0;
+    float output_gain = OUTPUT_GAIN;
     // "_ok" = pile dessus en ce moment ; "_latched" = déjà trouvé une fois -> reste vrai pour le
     // reste de la partie (comme une porte déverrouillée, pas besoin de tenir la clé).
     bool cle_ok = false, tonalite_ok = false, vitesse_ok = false;
@@ -752,6 +757,8 @@ static void audio_task(void *arg)
         // Porte : les 3 verrouillées -> son normal (passe-droit), et ça reste vrai même si on bouge
         // les contrôles après (une fois trouvé, pas besoin de tenir la position). Sinon -> brouillé.
         bool all_ok = cle_latched && tonalite_latched && vitesse_latched;
+        float target_gain = all_ok ? OUTPUT_GAIN * SOLVED_VOLUME_BOOST : OUTPUT_GAIN;
+        output_gain += GAIN_RAMP_ALPHA * (target_gain - output_gain);
 
         float y;
         if (all_ok) {
@@ -797,7 +804,7 @@ static void audio_task(void *arg)
             y = biquad_process(&shelf_haut, y);
         }
 
-        float v = 128.0f + OUTPUT_GAIN * y * 127.0f;
+        float v = 128.0f + output_gain * y * 127.0f;
         if (fabsf(y) > output_peak) {
             output_peak = fabsf(y);
         }
