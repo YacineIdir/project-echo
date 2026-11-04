@@ -7,6 +7,8 @@
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_continuous.h"
+#include "esp_heap_caps.h"
 #include "driver/dac_oneshot.h"
 #include "dfplayer_mini.h"
 #include "led.h"
@@ -25,13 +27,24 @@
 #define LED_JOY_GPIO      GPIO_NUM_15 // LED qui guide/verrouille sur le joystick (tonalité+vitesse)
 
 // --- Échantillonnage ---
-// 20 kHz : Nyquist à 10 kHz -> les produits du mélange (porteuse jusqu'à 3800 Hz + voix jusqu'à 3000 Hz,
-// soit ~6800 Hz) restent sous le repliement. Mesuré sur la carte : une itération de la boucle prend
-// ~46 µs (surtout adc_oneshot_read), donc le maximum est ~21,9 kHz -> 20 kHz (50 µs) garde de la marge.
-// Pour aller plus haut il faudrait passer l'entrée audio en ADC continu (DMA).
-#define FS_HZ             20000
+// 44,1 kHz. L'entrée passe par l'ADC continu (DMA) : adc_oneshot_read prenait ~40 µs par lecture et
+// plafonnait la boucle à ~21,9 kHz. La sortie reste en dac_oneshot cadencé par la boucle (sur l'ESP32,
+// le DAC en DMA utilise le même I2S0 que l'ADC continu, impossible d'avoir les deux).
 // On calcule l'échéance de chaque échantillon à partir du compteur (voir audio_task) pour que le taux
 // réel soit exactement FS_HZ même si la période n'est pas un nombre entier de µs.
+#define FS_HZ             44100
+
+// --- ADC continu : les 4 entrées (audio, pot, joystick X/Y) tournent en boucle dans le motif DMA,
+// donc chacune est échantillonnée à FS_HZ, à intervalles réguliers. ---
+#define ADC_NUM_CHANNELS   4
+#define ADC_FRAME_RESULTS  256 // 64 échantillons audio par trame (~1,45 ms)
+#define ADC_FRAME_BYTES    (ADC_FRAME_RESULTS * SOC_ADC_DIGI_RESULT_BYTES)
+#define ADC_POOL_BYTES     (16 * 1024) // ~46 ms de marge si la tâche audio est retardée
+// File entre l'ADC et la boucle de sortie. Les horloges ADC et esp_timer dérivent un peu l'une par
+// rapport à l'autre : on garde le niveau entre 0 et AUDIO_FIFO_HIGH, sinon on jette l'excédent.
+#define AUDIO_FIFO_LEN     2048 // puissance de 2
+#define AUDIO_FIFO_REFILL  128  // on relit l'ADC quand la file descend sous ce niveau
+#define AUDIO_FIFO_HIGH    1024 // au-delà (~23 ms de latence), on revient à AUDIO_FIFO_REFILL
 
 // --- Filtre passe-bande de l'inversion (comme le script Python : butter(8,[300,3000],bandpass),
 // approximé ici par un passe-haut 300Hz 4e ordre + passe-bas 3000Hz 4e ordre en cascade = 8e ordre) ---
@@ -62,10 +75,14 @@
 #define TONALITE_FEEDBACK_RANGE_DB ((TONALITE_DB_MAX - TONALITE_DB_MIN) / 2.0f) // échelle du clignotement
 
 // --- Vitesse (joystick Y) : relecture à débit variable dans un tampon circulaire. Plage fixe, cible aléatoire. ---
-// Backlog max avant que le tampon ne boucle. 2,4 s à 20 kHz = 48000 échantillons = 96 Ko, comme avant
-// (3 s à 16 kHz) : plus gros risquerait de dépasser le plus grand bloc libre de la RAM de l'ESP32.
-#define SPEED_BUF_SECONDS   2.4f
-#define SPEED_BUF_LEN       ((int)(SPEED_BUF_SECONDS * FS_HZ))
+// Backlog max avant que le tampon ne boucle : 65536 échantillons = ~1,5 s à 44,1 kHz (128 Ko).
+// Découpé en 4 blocs de 32 Ko, car un seul bloc de 128 Ko ne tient pas dans le plus grand morceau
+// libre de la RAM de l'ESP32. Longueur en puissance de 2 -> bouclage par masque.
+#define SPEED_CHUNK_SHIFT   14
+#define SPEED_CHUNK_LEN     (1 << SPEED_CHUNK_SHIFT)
+#define SPEED_NUM_CHUNKS    4
+#define SPEED_BUF_LEN       (SPEED_CHUNK_LEN * SPEED_NUM_CHUNKS)
+#define SPEED_AT(chunks, i) ((chunks)[(i) >> SPEED_CHUNK_SHIFT][(i) & (SPEED_CHUNK_LEN - 1)])
 #define PLAYBACK_RATE_MIN   0.5f
 #define PLAYBACK_RATE_MAX   1.5f
 #define PLAYBACK_RATE_MARGIN 0.1f
@@ -193,7 +210,8 @@ static void carrier_table_init(void)
 }
 
 typedef struct {
-    adc_oneshot_unit_handle_t adc_handle;
+    adc_oneshot_unit_handle_t adc_handle; // seulement pour la mesure au boot, libéré ensuite
+    adc_continuous_handle_t adc_cont;
     adc_channel_t audio_channel;
     adc_channel_t pot_channel;
     adc_channel_t joy_x_channel;
@@ -307,6 +325,159 @@ static void audio_io_init(audio_io_t *io)
     ESP_LOGI(TAG_AUDIO, "  joystick X (tonalite)    : %.1f dB", io->cible_tonalite_db);
     ESP_LOGI(TAG_AUDIO, "  joystick Y (vitesse)     : %.3f x", io->cible_playback_rate);
     ESP_LOGI(TAG_AUDIO, "==============================================");
+
+    // L'ADC1 ne peut pas être en oneshot et en continu à la fois : on libère le oneshot (qui n'a
+    // servi qu'à la mesure de repos ci-dessus) et on passe tout en continu. Démarré ici, depuis le
+    // cœur 0, pour que l'interruption DMA tourne sur le cœur 0 et ne perturbe pas la boucle audio.
+    ESP_ERROR_CHECK(adc_oneshot_del_unit(io->adc_handle));
+    io->adc_handle = NULL;
+
+    adc_continuous_handle_cfg_t cont_cfg = {
+        .max_store_buf_size = ADC_POOL_BYTES,
+        .conv_frame_size = ADC_FRAME_BYTES,
+        .flags.flush_pool = 1, // si le pool déborde, on jette le vieux plutôt que de bloquer
+    };
+    ESP_ERROR_CHECK(adc_continuous_new_handle(&cont_cfg, &io->adc_cont));
+
+    adc_digi_pattern_config_t pattern[ADC_NUM_CHANNELS];
+    const adc_channel_t channels[ADC_NUM_CHANNELS] = {
+        io->audio_channel, io->pot_channel, io->joy_x_channel, io->joy_y_channel,
+    };
+    for (int i = 0; i < ADC_NUM_CHANNELS; i++) {
+        pattern[i].atten = ADC_ATTEN_DB_12;
+        pattern[i].channel = channels[i];
+        pattern[i].unit = ADC_UNIT_1;
+        pattern[i].bit_width = ADC_BITWIDTH_12;
+    }
+    adc_continuous_config_t dig_cfg = {
+        .pattern_num = ADC_NUM_CHANNELS,
+        .adc_pattern = pattern,
+        .sample_freq_hz = FS_HZ * ADC_NUM_CHANNELS,
+        .conv_mode = ADC_CONV_SINGLE_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_continuous_config(io->adc_cont, &dig_cfg));
+    ESP_ERROR_CHECK(adc_continuous_start(io->adc_cont));
+    ESP_LOGI(TAG_AUDIO, "ADC continu demarre: %d voies x %d Hz", ADC_NUM_CHANNELS, FS_HZ);
+}
+
+// --- Entrée : trames DMA -> file audio + dernières valeurs des contrôles ---
+typedef struct {
+    uint8_t raw[ADC_FRAME_BYTES];
+    adc_continuous_data_t parsed[ADC_FRAME_RESULTS];
+    uint16_t fifo[AUDIO_FIFO_LEN];
+    uint32_t head, tail; // niveau = head - tail
+    uint16_t last_audio;
+    int pot_raw, joy_x_raw, joy_y_raw; // -1 tant qu'aucune valeur reçue
+    uint32_t audio_received;
+    uint32_t underruns, overruns;
+} adc_input_t;
+
+static adc_input_t s_in;
+
+static void adc_input_reset(adc_input_t *in)
+{
+    in->head = in->tail = 0;
+    in->last_audio = 2048;
+    in->pot_raw = in->joy_x_raw = in->joy_y_raw = -1;
+    in->audio_received = 0;
+    in->underruns = in->overruns = 0;
+}
+
+// Lit une trame (si dispo) et la répartit. timeout_ms = 0 -> ne bloque jamais.
+static void adc_input_pump(audio_io_t *io, adc_input_t *in, uint32_t timeout_ms)
+{
+    uint32_t len = 0;
+    if (adc_continuous_read(io->adc_cont, in->raw, ADC_FRAME_BYTES, &len, timeout_ms) != ESP_OK || len == 0) {
+        return;
+    }
+    uint32_t n = 0;
+    if (adc_continuous_parse_data(io->adc_cont, in->raw, len, in->parsed, &n) != ESP_OK) {
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        const adc_continuous_data_t *d = &in->parsed[i];
+        if (!d->valid) {
+            continue;
+        }
+        if (d->channel == io->audio_channel) {
+            if (in->head - in->tail >= AUDIO_FIFO_LEN) {
+                in->tail++; // file pleine : on jette le plus vieux
+                in->overruns++;
+            }
+            in->fifo[in->head & (AUDIO_FIFO_LEN - 1)] = (uint16_t)d->raw_data;
+            in->head++;
+            in->audio_received++;
+        } else if (d->channel == io->pot_channel) {
+            in->pot_raw = (int)d->raw_data;
+        } else if (d->channel == io->joy_x_channel) {
+            in->joy_x_raw = (int)d->raw_data;
+        } else if (d->channel == io->joy_y_channel) {
+            in->joy_y_raw = (int)d->raw_data;
+        }
+    }
+}
+
+// Vide les trames en attente dans le pool du driver (adc_continuous_flush_pool refuse de le faire
+// pendant que l'ADC tourne), puis repart d'une file vide.
+static void adc_input_drain(audio_io_t *io, adc_input_t *in)
+{
+    uint32_t len = 0;
+    while (adc_continuous_read(io->adc_cont, in->raw, ADC_FRAME_BYTES, &len, 0) == ESP_OK && len > 0) {
+    }
+    in->head = in->tail = 0;
+}
+
+static inline uint16_t adc_input_pop(adc_input_t *in)
+{
+    uint32_t level = in->head - in->tail;
+    if (level > AUDIO_FIFO_HIGH) {
+        // L'ADC va un peu plus vite que la sortie : on rattrape d'un coup plutôt que de laisser la
+        // latence grimper.
+        in->tail = in->head - AUDIO_FIFO_REFILL;
+        in->overruns++;
+    } else if (level == 0) {
+        in->underruns++; // l'ADC est en retard : on répète le dernier échantillon
+        return in->last_audio;
+    }
+    in->last_audio = in->fifo[in->tail & (AUDIO_FIFO_LEN - 1)];
+    in->tail++;
+    return in->last_audio;
+}
+
+// --- Stats affichées par une tâche séparée (cœur 0) : l'affichage série prend plusieurs ms et
+// bloquerait la boucle audio s'il était fait dedans. ---
+typedef struct {
+    float carrier_hz, tonalite_db, playback_rate, input_peak, output_peak;
+    const char *etat_cle, *etat_ton, *etat_vit;
+    uint32_t clip_count, delay_count, underruns, overruns;
+    int fs_out, fs_adc;
+    bool ready;
+} audio_stats_t;
+
+static audio_stats_t s_stats;
+static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void log_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        audio_stats_t st;
+        taskENTER_CRITICAL(&s_stats_mux);
+        st = s_stats;
+        s_stats.ready = false;
+        taskEXIT_CRITICAL(&s_stats_mux);
+        if (!st.ready) {
+            continue;
+        }
+        ESP_LOGI(TAG_AUDIO,
+                 "porteuse=%.1fHz(%s)  tonalite=%.1fdB(%s)  vitesse=%.3fx(%s)  "
+                 "crete_in=%.3f  crete_out=%.3f  ecretages=%u  retards=%u  "
+                 "fs_reel=%dHz  fs_adc=%dHz  manques=%u  surplus=%u",
+                 st.carrier_hz, st.etat_cle, st.tonalite_db, st.etat_ton, st.playback_rate, st.etat_vit,
+                 st.input_peak, st.output_peak, st.clip_count, st.delay_count,
+                 st.fs_out, st.fs_adc, st.underruns, st.overruns);
+    }
 }
 
 typedef struct {
@@ -341,12 +512,19 @@ static void audio_task(void *arg)
     biquad_set_shelf(&shelf_haut, false, SHELF_HAUT_FC_HZ, 0.0f, FS_HZ);
 
     // --- Tampon de relecture à débit variable (clé = joystick Y) ---
-    int16_t *speed_buf = calloc(SPEED_BUF_LEN, sizeof(int16_t));
-    if (speed_buf == NULL) {
-        ESP_LOGE(TAG_AUDIO, "Pas assez de RAM pour le tampon de vitesse (%d echantillons)", SPEED_BUF_LEN);
-        vTaskDelete(NULL);
-        return;
+    int16_t *speed_buf[SPEED_NUM_CHUNKS];
+    for (int c = 0; c < SPEED_NUM_CHUNKS; c++) {
+        speed_buf[c] = heap_caps_calloc(SPEED_CHUNK_LEN, sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        if (speed_buf[c] == NULL) {
+            ESP_LOGE(TAG_AUDIO, "Pas assez de RAM pour le tampon de vitesse (bloc %d/%d, libre=%u, plus grand bloc=%u)",
+                     c + 1, SPEED_NUM_CHUNKS, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+            vTaskDelete(NULL);
+            return;
+        }
     }
+    ESP_LOGI(TAG_AUDIO, "Tampon de vitesse: %d echantillons (%.2f s), RAM libre restante=%u",
+             SPEED_BUF_LEN, (float)SPEED_BUF_LEN / FS_HZ, (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT));
     uint32_t write_index = 0;
     float read_pos = 0.0f;
 
@@ -356,13 +534,15 @@ static void audio_task(void *arg)
     // première seconde, la valeur lissée "balaie" artificiellement du minimum vers la vraie position
     // -> elle peut traverser la cible par hasard et se verrouiller tout de suite, sans que le joueur
     // touche à rien.
-    int init_pot_raw = 0, init_joy_x_raw = 0, init_joy_y_raw = 0;
-    adc_oneshot_read(io->adc_handle, io->pot_channel, &init_pot_raw);
-    adc_oneshot_read(io->adc_handle, io->joy_x_channel, &init_joy_x_raw);
-    adc_oneshot_read(io->adc_handle, io->joy_y_channel, &init_joy_y_raw);
-    float pot_smooth = (float)init_pot_raw / 4095.0f;
-    float joy_x_smooth = (float)init_joy_x_raw / 4095.0f; // 0..1
-    float joy_y_smooth = (float)init_joy_y_raw / 4095.0f; // 0..1
+    adc_input_t *in = &s_in;
+    adc_input_reset(in);
+    adc_input_drain(io, in);
+    while (in->pot_raw < 0 || in->joy_x_raw < 0 || in->joy_y_raw < 0) {
+        adc_input_pump(io, in, 100);
+    }
+    float pot_smooth = (float)in->pot_raw / 4095.0f;
+    float joy_x_smooth = (float)in->joy_x_raw / 4095.0f; // 0..1
+    float joy_y_smooth = (float)in->joy_y_raw / 4095.0f; // 0..1
 
     float carrier_hz = CARRIER_MIN_HZ + pot_smooth * (CARRIER_MAX_HZ - CARRIER_MIN_HZ);
     float tonalite_db = TONALITE_DB_MIN + joy_x_smooth * (TONALITE_DB_MAX - TONALITE_DB_MIN);
@@ -383,8 +563,28 @@ static void audio_task(void *arg)
     int led_joy_interval_ms = LED_BLINK_SLOW_MS;
 
     ESP_LOGI(TAG_AUDIO, "Mesure du centre de l'entree audio (2000 echantillons)...");
-    center = measure_channel_average(io, io->audio_channel, 2000);
+    {
+        int64_t sum = 0;
+        int count = 0;
+        while (count < 2000) {
+            if (in->head == in->tail) {
+                adc_input_pump(io, in, 100);
+                continue;
+            }
+            sum += adc_input_pop(in);
+            count++;
+        }
+        center = (float)sum / (float)count;
+    }
     ESP_LOGI(TAG_AUDIO, "Centre audio mesure: %.1f", center);
+
+    // On repart d'une file vide puis on la pré-remplit un peu, pour démarrer avec une marge.
+    adc_input_drain(io, in);
+    adc_input_reset(in);
+    while (in->head - in->tail < AUDIO_FIFO_REFILL * 2) {
+        adc_input_pump(io, in, 100);
+    }
+    uint32_t report_audio_received = in->audio_received;
 
     int64_t schedule_start_us = esp_timer_get_time();
     int64_t schedule_index = 0; // nb d'échantillons depuis schedule_start_us
@@ -415,11 +615,12 @@ static void audio_task(void *arg)
         schedule_index++;
         next_sample_us = schedule_start_us + (schedule_index * 1000000LL) / FS_HZ;
 
+        if (in->head - in->tail < AUDIO_FIFO_REFILL) {
+            adc_input_pump(io, in, 0);
+        }
+
         if (sample_counter % ctrl_read_every_n_samples == 0) {
-            int pot_raw = 0, joy_x_raw = 0, joy_y_raw = 0;
-            adc_oneshot_read(io->adc_handle, io->pot_channel, &pot_raw);
-            adc_oneshot_read(io->adc_handle, io->joy_x_channel, &joy_x_raw);
-            adc_oneshot_read(io->adc_handle, io->joy_y_channel, &joy_y_raw);
+            int pot_raw = in->pot_raw, joy_x_raw = in->joy_x_raw, joy_y_raw = in->joy_y_raw;
 
             float pot_norm = (float)pot_raw / 4095.0f;
             pot_smooth += CTRL_SMOOTH_ALPHA * (pot_norm - pot_smooth);
@@ -498,8 +699,7 @@ static void audio_task(void *arg)
         }
 
         // 1. Lecture brute + centrage
-        int raw = 0;
-        adc_oneshot_read(io->adc_handle, io->audio_channel, &raw);
+        int raw = adc_input_pop(in);
         center += CENTER_TRACK_ALPHA * ((float)raw - center);
         float x = ((float)raw - center) / 2048.0f;
         if (fabsf(x) > input_peak) {
@@ -520,14 +720,14 @@ static void audio_task(void *arg)
             y = biquad_process(&clean_lp_2, y);
         } else {
             // 2. Vitesse : on écrit l'échantillon courant, on relit à un débit fractionnaire (joystick Y)
-            speed_buf[write_index] = (int16_t)(x * 32767.0f);
-            write_index = (write_index + 1) % SPEED_BUF_LEN;
+            SPEED_AT(speed_buf, write_index) = (int16_t)(x * 32767.0f);
+            write_index = (write_index + 1) & (SPEED_BUF_LEN - 1);
 
-            uint32_t idx0 = (uint32_t)read_pos;
-            uint32_t idx1 = (idx0 + 1) % SPEED_BUF_LEN;
-            float frac = read_pos - (float)idx0;
-            float x_speed = ((float)speed_buf[idx0] / 32767.0f) * (1.0f - frac)
-                           + ((float)speed_buf[idx1] / 32767.0f) * frac;
+            uint32_t idx0 = (uint32_t)read_pos & (SPEED_BUF_LEN - 1);
+            uint32_t idx1 = (idx0 + 1) & (SPEED_BUF_LEN - 1);
+            float frac = read_pos - (float)(uint32_t)read_pos;
+            float x_speed = ((float)SPEED_AT(speed_buf, idx0) / 32767.0f) * (1.0f - frac)
+                           + ((float)SPEED_AT(speed_buf, idx1) / 32767.0f) * frac;
             read_pos += playback_rate;
             if (read_pos >= (float)SPEED_BUF_LEN) {
                 read_pos -= (float)SPEED_BUF_LEN;
@@ -569,13 +769,28 @@ static void audio_task(void *arg)
             const char *etat_cle = cle_latched ? "LOCK" : (cle_ok ? "OK" : "--");
             const char *etat_ton = tonalite_latched ? "LOCK" : (tonalite_ok ? "OK" : "--");
             const char *etat_vit = vitesse_latched ? "LOCK" : (vitesse_ok ? "OK" : "--");
-            ESP_LOGI(TAG_AUDIO,
-                     "porteuse=%.1fHz(%s)  tonalite=%.1fdB(%s)  vitesse=%.3fx(%s)  "
-                     "crete_in=%.3f  crete_out=%.3f  ecretages=%u  retards=%u  fs_reel=%dHz",
-                     carrier_hz, etat_cle, tonalite_db, etat_ton, playback_rate, etat_vit,
-                     input_peak, output_peak, clip_count, delay_count,
-                     (int)((int64_t)(sample_counter - report_sample_counter) * 1000000LL / (now_us - last_report_us)));
+            int64_t dt_us = now_us - last_report_us;
+            taskENTER_CRITICAL(&s_stats_mux);
+            s_stats.carrier_hz = carrier_hz;
+            s_stats.tonalite_db = tonalite_db;
+            s_stats.playback_rate = playback_rate;
+            s_stats.etat_cle = etat_cle;
+            s_stats.etat_ton = etat_ton;
+            s_stats.etat_vit = etat_vit;
+            s_stats.input_peak = input_peak;
+            s_stats.output_peak = output_peak;
+            s_stats.clip_count = clip_count;
+            s_stats.delay_count = delay_count;
+            s_stats.underruns = in->underruns;
+            s_stats.overruns = in->overruns;
+            s_stats.fs_out = (int)((int64_t)(sample_counter - report_sample_counter) * 1000000LL / dt_us);
+            s_stats.fs_adc = (int)((int64_t)(in->audio_received - report_audio_received) * 1000000LL / dt_us);
+            s_stats.ready = true;
+            taskEXIT_CRITICAL(&s_stats_mux);
             report_sample_counter = sample_counter;
+            report_audio_received = in->audio_received;
+            in->underruns = 0;
+            in->overruns = 0;
             delay_count = 0; // compté par période de rapport (0,5 s), plus facile à lire
             input_peak = 0.0f;
             output_peak = 0.0f;
@@ -625,6 +840,7 @@ void app_main(void)
     static audio_task_args_t audio_args;
     audio_args.io = &io;
     xTaskCreatePinnedToCore(audio_task, "audio_decode_task", 4096, &audio_args, 10, NULL, 1);
+    xTaskCreatePinnedToCore(log_task, "audio_log_task", 3072, NULL, 2, NULL, 0);
 
     dfplayer_mini_config_t cfg = DFPLAYER_MINI_CONFIG_DEFAULT();
     cfg.tx_gpio    = TX_GPIO;
