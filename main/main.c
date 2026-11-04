@@ -449,7 +449,7 @@ static inline uint16_t adc_input_pop(adc_input_t *in)
 typedef struct {
     float carrier_hz, tonalite_db, playback_rate, input_peak, output_peak;
     const char *etat_cle, *etat_ton, *etat_vit;
-    uint32_t clip_count, delay_count, underruns, overruns;
+    uint32_t clip_count, delay_count, underruns, overruns, max_late_us;
     int fs_out, fs_adc;
     bool ready;
 } audio_stats_t;
@@ -460,6 +460,73 @@ static audio_stats_t s_stats;
 // DFPlayer s'est tu. Le bruit de fond mesuré à l'arrêt est ~0,008, la voix ~0,2-0,3.
 #define AUDIO_LOUD_THRESHOLD 0.04f
 static volatile uint32_t s_last_loud_ms;
+
+// État des contrôles publié par la boucle audio, lu par led_task (mots de 32 bits : pas de verrou).
+typedef struct {
+    volatile float carrier_hz, tonalite_db, playback_rate;
+    volatile bool cle_latched, joy_latched, valid;
+} led_state_t;
+
+static led_state_t s_led;
+
+// Pilote les 2 LED (clignotement selon l'écart à la cible, fixe une fois verrouillé). Tourne sur le
+// cœur 0 : led_start_blinking / led_stop_blinking écrivent dans le log et ne doivent pas bloquer
+// la boucle audio.
+static void led_task(void *arg)
+{
+    audio_io_t *io = (audio_io_t *)arg;
+    bool led_pot_on_solid = false, led_joy_on_solid = false;
+    int led_pot_interval_ms = 0, led_joy_interval_ms = 0; // 0 = pas encore démarré
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        if (!s_led.valid) {
+            continue;
+        }
+
+        // LED du potentiomètre : clignote selon l'écart à la clé, fixe une fois verrouillée.
+        // (échelle = moitié du parcours total, pas la tolérance -> ça accélère sur tout le tour,
+        // pas juste dans la petite fenêtre de tolérance)
+        float err_cle = fabsf(s_led.carrier_hz - io->cible_carrier_hz) / F_CLE_FEEDBACK_RANGE_HZ;
+        if (err_cle > 1.0f) {
+            err_cle = 1.0f;
+        }
+        if (s_led.cle_latched) {
+            if (!led_pot_on_solid) {
+                led_stop_blinking(&io->led_pot);
+                led_set(&io->led_pot, true);
+                led_pot_on_solid = true;
+            }
+        } else {
+            int new_interval_ms = LED_BLINK_FAST_MS + (int)(err_cle * (LED_BLINK_SLOW_MS - LED_BLINK_FAST_MS));
+            if (led_pot_interval_ms == 0 || abs(new_interval_ms - led_pot_interval_ms) > 20) {
+                led_pot_interval_ms = new_interval_ms;
+                led_start_blinking(&io->led_pot, led_pot_interval_ms);
+            }
+        }
+
+        // LED du joystick : clignote selon la moyenne des écarts tonalité+vitesse, fixe une fois
+        // les deux verrouillées.
+        float err_ton = fabsf(s_led.tonalite_db - io->cible_tonalite_db) / TONALITE_FEEDBACK_RANGE_DB;
+        float err_vit = fabsf(s_led.playback_rate - io->cible_playback_rate) / PLAYBACK_RATE_FEEDBACK_RANGE;
+        float err_joy = (err_ton + err_vit) / 2.0f;
+        if (err_joy > 1.0f) {
+            err_joy = 1.0f;
+        }
+        if (s_led.joy_latched) {
+            if (!led_joy_on_solid) {
+                led_stop_blinking(&io->led_joy);
+                led_set(&io->led_joy, true);
+                led_joy_on_solid = true;
+            }
+        } else {
+            int new_interval_ms = LED_BLINK_FAST_MS + (int)(err_joy * (LED_BLINK_SLOW_MS - LED_BLINK_FAST_MS));
+            if (led_joy_interval_ms == 0 || abs(new_interval_ms - led_joy_interval_ms) > 20) {
+                led_joy_interval_ms = new_interval_ms;
+                led_start_blinking(&io->led_joy, led_joy_interval_ms);
+            }
+        }
+    }
+}
 static portMUX_TYPE s_stats_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void log_task(void *arg)
@@ -478,9 +545,9 @@ static void log_task(void *arg)
         ESP_LOGI(TAG_AUDIO,
                  "porteuse=%.1fHz(%s)  tonalite=%.1fdB(%s)  vitesse=%.3fx(%s)  "
                  "crete_in=%.3f  crete_out=%.3f  ecretages=%u  retards=%u  "
-                 "fs_reel=%dHz  fs_adc=%dHz  manques=%u  surplus=%u",
+                 "retard_max=%uus  fs_reel=%dHz  fs_adc=%dHz  manques=%u  surplus=%u",
                  st.carrier_hz, st.etat_cle, st.tonalite_db, st.etat_ton, st.playback_rate, st.etat_vit,
-                 st.input_peak, st.output_peak, st.clip_count, st.delay_count,
+                 st.input_peak, st.output_peak, st.clip_count, st.delay_count, st.max_late_us,
                  st.fs_out, st.fs_adc, st.underruns, st.overruns);
     }
 }
@@ -558,14 +625,12 @@ static void audio_task(void *arg)
     float output_peak = 0.0f;
     uint32_t delay_count = 0;
     uint32_t clip_count = 0;
+    uint32_t max_late_us = 0;
     // "_ok" = pile dessus en ce moment ; "_latched" = déjà trouvé une fois -> reste vrai pour le
     // reste de la partie (comme une porte déverrouillée, pas besoin de tenir la clé).
     bool cle_ok = false, tonalite_ok = false, vitesse_ok = false;
     bool cle_latched = false, tonalite_latched = false, vitesse_latched = false;
     int cle_ok_streak = 0, tonalite_ok_streak = 0, vitesse_ok_streak = 0;
-    bool led_pot_on_solid = false, led_joy_on_solid = false;
-    int led_pot_interval_ms = LED_BLINK_SLOW_MS;
-    int led_joy_interval_ms = LED_BLINK_SLOW_MS;
 
     ESP_LOGI(TAG_AUDIO, "Mesure du centre de l'entree audio (2000 echantillons)...");
     {
@@ -609,6 +674,10 @@ static void audio_task(void *arg)
             }
         } else if (now_us > next_sample_us) {
             delay_count++;
+            uint32_t late_us = (uint32_t)(now_us - next_sample_us);
+            if (late_us > max_late_us) {
+                max_late_us = late_us;
+            }
             // Petit retard (lecture des contrôles toutes les 10 ms, affichage du log toutes les 0,5 s) :
             // on enchaîne sans attendre pour le rattraper, sinon le taux réel tombe sous FS_HZ.
             // Gros retard (> 20 ms) : on resynchronise.
@@ -658,49 +727,15 @@ static void audio_task(void *arg)
         }
 
         if (sample_counter % led_update_every_n_samples == 0) {
-            // LED du potentiomètre : clignote selon l'écart à la clé, fixe une fois verrouillée.
-            // (échelle = moitié du parcours total, pas la tolérance -> ça accélère sur tout le tour,
-            // pas juste dans la petite fenêtre de tolérance)
-            float err_cle = fabsf(carrier_hz - io->cible_carrier_hz) / F_CLE_FEEDBACK_RANGE_HZ;
-            if (err_cle > 1.0f) {
-                err_cle = 1.0f;
-            }
-            if (cle_latched) {
-                if (!led_pot_on_solid) {
-                    led_stop_blinking(&io->led_pot);
-                    led_set(&io->led_pot, true);
-                    led_pot_on_solid = true;
-                }
-            } else {
-                int new_interval_ms = LED_BLINK_FAST_MS + (int)(err_cle * (LED_BLINK_SLOW_MS - LED_BLINK_FAST_MS));
-                if (abs(new_interval_ms - led_pot_interval_ms) > 20) {
-                    led_pot_interval_ms = new_interval_ms;
-                    led_start_blinking(&io->led_pot, led_pot_interval_ms);
-                }
-            }
-
-            // LED du joystick : clignote selon la moyenne des écarts tonalité+vitesse, fixe une fois
-            // les deux verrouillées.
-            float err_ton = fabsf(tonalite_db - io->cible_tonalite_db) / TONALITE_FEEDBACK_RANGE_DB;
-            float err_vit = fabsf(playback_rate - io->cible_playback_rate) / PLAYBACK_RATE_FEEDBACK_RANGE;
-            float err_joy = (err_ton + err_vit) / 2.0f;
-            if (err_joy > 1.0f) {
-                err_joy = 1.0f;
-            }
-            bool want_solid = tonalite_latched && vitesse_latched;
-            if (want_solid) {
-                if (!led_joy_on_solid) {
-                    led_stop_blinking(&io->led_joy);
-                    led_set(&io->led_joy, true);
-                    led_joy_on_solid = true;
-                }
-            } else {
-                int new_interval_ms = LED_BLINK_FAST_MS + (int)(err_joy * (LED_BLINK_SLOW_MS - LED_BLINK_FAST_MS));
-                if (abs(new_interval_ms - led_joy_interval_ms) > 20) {
-                    led_joy_interval_ms = new_interval_ms;
-                    led_start_blinking(&io->led_joy, led_joy_interval_ms);
-                }
-            }
+            // On publie seulement l'état : les LED sont pilotées par led_task sur le cœur 0.
+            // (led_start_blinking écrit dans le log série, ~5 ms bloquantes : appelé ici, chaque
+            // changement de cadence faisait un trou dans le son -> claquements en rafale.)
+            s_led.carrier_hz = carrier_hz;
+            s_led.tonalite_db = tonalite_db;
+            s_led.playback_rate = playback_rate;
+            s_led.cle_latched = cle_latched;
+            s_led.joy_latched = tonalite_latched && vitesse_latched;
+            s_led.valid = true;
         }
 
         // 1. Lecture brute + centrage
@@ -789,6 +824,7 @@ static void audio_task(void *arg)
             s_stats.output_peak = output_peak;
             s_stats.clip_count = clip_count;
             s_stats.delay_count = delay_count;
+            s_stats.max_late_us = max_late_us;
             s_stats.underruns = in->underruns;
             s_stats.overruns = in->overruns;
             s_stats.fs_out = (int)((int64_t)(sample_counter - report_sample_counter) * 1000000LL / dt_us);
@@ -799,6 +835,7 @@ static void audio_task(void *arg)
             report_audio_received = in->audio_received;
             in->underruns = 0;
             in->overruns = 0;
+            max_late_us = 0;
             delay_count = 0; // compté par période de rapport (0,5 s), plus facile à lire
             input_peak = 0.0f;
             output_peak = 0.0f;
@@ -849,6 +886,7 @@ void app_main(void)
     audio_args.io = &io;
     xTaskCreatePinnedToCore(audio_task, "audio_decode_task", 4096, &audio_args, 10, NULL, 1);
     xTaskCreatePinnedToCore(log_task, "audio_log_task", 3072, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(led_task, "led_task", 3072, &io, 2, NULL, 0);
 
     dfplayer_mini_config_t cfg = DFPLAYER_MINI_CONFIG_DEFAULT();
     cfg.tx_gpio    = TX_GPIO;
